@@ -351,6 +351,168 @@ func TestMigrateVMCPDefaultAdminGroups(t *testing.T) {
 	}
 }
 
+func TestMigrateMigratedVMCPEverythingAdminGroups(t *testing.T) {
+	everythingRule := func() *v1.AccessControlRule {
+		return &v1.AccessControlRule{
+			Name:      everythingAccessControlRuleName,
+			Namespace: system.DefaultNamespace,
+			Spec: v1.AccessControlRuleSpec{
+				MCPCatalogID: system.DefaultCatalog,
+				Manifest: types.AccessControlRuleManifest{
+					DisplayName: "Everything",
+					Subjects:    []types.Subject{{Type: types.SubjectTypeObotGroup, ID: types.GroupAdmin}},
+				},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		rule        *v1.AccessControlRule
+		legacySlug  string
+		profileName string
+		allowAll    bool
+		subjectType types.SubjectType
+		subjectID   string
+		wantType    types.SubjectType
+	}{
+		{
+			name:        "profile named for the rule's display name",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeObotGroup,
+		},
+		{
+			name:        "profile named for the rule",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: everythingAccessControlRuleName,
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeObotGroup,
+		},
+		{
+			name:        "profile named for the rule with a suffix",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: everythingAccessControlRuleName + "-2",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeObotGroup,
+		},
+		{
+			name:        "vMCP not created by a migration",
+			rule:        everythingRule(),
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeGroup,
+		},
+		{
+			name:        "profile from another rule",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: "Engineering",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeGroup,
+		},
+		{
+			name:        "restricted profile",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeGroup,
+		},
+		{
+			name:        "other IdP group",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   "other",
+			wantType:    types.SubjectTypeGroup,
+		},
+		{
+			name:        "already migrated",
+			rule:        everythingRule(),
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeObotGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeObotGroup,
+		},
+		{
+			name:        "no everything rule",
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeGroup,
+		},
+		{
+			name: "everything rule of another catalog",
+			rule: func() *v1.AccessControlRule {
+				rule := everythingRule()
+				rule.Spec.MCPCatalogID = "other"
+				return rule
+			}(),
+			legacySlug:  "default-server",
+			profileName: "Everything",
+			allowAll:    true,
+			subjectType: types.SubjectTypeGroup,
+			subjectID:   types.GroupAdmin,
+			wantType:    types.SubjectTypeGroup,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vmcp := &v1.VMCP{
+				Name:      "vmcp",
+				Namespace: system.DefaultNamespace,
+				Spec: v1.VMCPSpec{
+					LegacySlug: tc.legacySlug,
+					Manifest: types.VMCPManifest{
+						Profiles: []types.VMCPProfile{{
+							Name: tc.profileName,
+							Subjects: []types.Subject{
+								{Type: types.SubjectTypeUser, ID: "other"},
+								{Type: tc.subjectType, ID: tc.subjectID},
+							},
+							Permissions: types.VMCPProfilePermissions{AllowAllComponents: tc.allowAll},
+						}},
+					},
+				},
+			}
+			objects := []kclient.Object{vmcp}
+			if tc.rule != nil {
+				objects = append(objects, tc.rule)
+			}
+			client := newFakeClient(t, objects...)
+			want := vmcp.DeepCopy()
+			want.Spec.Manifest.Profiles[0].Subjects[1].Type = tc.wantType
+			for range 2 {
+				require.NoError(t, migrateMigratedVMCPEverythingAdminGroups(t.Context(), client))
+				var got v1.VMCP
+				require.NoError(t, client.Get(t.Context(), kclient.ObjectKeyFromObject(vmcp), &got))
+				assert.Equal(t, want.Spec, got.Spec)
+			}
+		})
+	}
+}
+
 func TestDeleteToolReferenceOwnedModels(t *testing.T) {
 	ctx := t.Context()
 	client := newFakeClient(t,

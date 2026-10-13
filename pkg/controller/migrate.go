@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
@@ -175,11 +176,80 @@ func migrateVMCPDefaultAdminGroups(ctx context.Context, client kclient.Client) e
 	return nil
 }
 
+// everythingAccessControlRuleName is the default rule that gives Obot admins every
+// MCP server of the default catalog.
+const everythingAccessControlRuleName = "acr1-everything"
+
+// migrateMigratedVMCPEverythingAdminGroups repairs vMCPs that the standalone and
+// composite MCP migrations created while the Everything rule still stored its admin
+// subject as an IdP group. Their profile is a copy of that rule's subjects, and
+// migrateVMCPDefaultAdminGroups only covers the profile named "default", so the copy
+// kept a group no Obot admin belongs to and nobody could connect to the vMCP.
+// The Everything rule is now migrated before those migrations run; this covers the
+// installs that had already run them.
+func migrateMigratedVMCPEverythingAdminGroups(ctx context.Context, client kclient.Client) error {
+	var rule v1.AccessControlRule
+	if err := client.Get(ctx, kclient.ObjectKey{
+		Namespace: system.DefaultNamespace,
+		Name:      everythingAccessControlRuleName,
+	}, &rule); apierrors.IsNotFound(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to get everything access control rule: %w", err)
+	}
+
+	if rule.Spec.MCPCatalogID != system.DefaultCatalog ||
+		rule.Spec.PowerUserWorkspaceID != "" {
+		return nil
+	}
+
+	// catalogmigration.AppendRuleProfile names a profile for the rule's display name,
+	// or for the rule name (suffixed when taken).
+	fromRule := func(profile string) bool {
+		return profile == rule.Name || strings.HasPrefix(profile, rule.Name+"-") ||
+			rule.Spec.Manifest.DisplayName != "" && profile == rule.Spec.Manifest.DisplayName
+	}
+
+	var vmcps v1.VMCPList
+	if err := client.List(ctx, &vmcps, kclient.InNamespace(rule.Namespace)); err != nil {
+		return err
+	}
+
+	for i := range vmcps.Items {
+		vmcp := &vmcps.Items[i]
+		if vmcp.Spec.LegacySlug == "" {
+			// Not created by a migration.
+			continue
+		}
+		var changed bool
+		for j := range vmcp.Spec.Manifest.Profiles {
+			profile := &vmcp.Spec.Manifest.Profiles[j]
+			if !profile.Permissions.AllowAllComponents || !fromRule(profile.Name) {
+				continue
+			}
+			for k := range profile.Subjects {
+				subject := &profile.Subjects[k]
+				if subject.Type == types.SubjectTypeGroup && subject.ID == types.GroupAdmin {
+					subject.Type = types.SubjectTypeObotGroup
+					changed = true
+				}
+			}
+		}
+		if changed {
+			if err := client.Update(ctx, vmcp); err != nil {
+				return fmt.Errorf("failed to migrate vMCP %s/%s: %w", vmcp.Namespace, vmcp.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
 func migrateEverythingAccessControlRuleAdminGroup(ctx context.Context, client kclient.Client) error {
 	var rule v1.AccessControlRule
 	if err := client.Get(ctx, kclient.ObjectKey{
 		Namespace: system.DefaultNamespace,
-		Name:      "acr1-everything",
+		Name:      everythingAccessControlRuleName,
 	}, &rule); apierrors.IsNotFound(err) {
 		return nil
 	} else if err != nil {
